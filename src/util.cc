@@ -40,6 +40,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <vector>
 
 #if defined(__APPLE__) || defined(__FreeBSD__)
@@ -1003,14 +1004,9 @@ static int DefaultCapacity(size_t running_jobs, int max_parallelism) {
   return capacity > 0 ? static_cast<int>(capacity) : 0;
 }
 
-int GetMemoryPressureCapacity(size_t running_jobs, int max_parallelism) {
-#if defined(_WIN32)
-  MEMORYSTATUSEX mem_status;
-  mem_status.dwLength = sizeof(mem_status);
-  if (!GlobalMemoryStatusEx(&mem_status)) {
-    return DefaultCapacity(running_jobs, max_parallelism);
-  }
-
+int CalculateMemoryPressureCapacity(const SystemMemoryInfo& mem_info,
+                                   size_t running_jobs,
+                                   int max_parallelism) {
   // Named constants for memory pressure thresholds
   constexpr uint64_t kMinCriticalBytes = 512ULL * 1024 * 1024;    // 512 MB critical threshold
   constexpr uint64_t kEstimatedJobBytes = 768ULL * 1024 * 1024;   // 768 MB estimated per compiler job
@@ -1023,14 +1019,14 @@ int GetMemoryPressureCapacity(size_t running_jobs, int max_parallelism) {
   // 1. Critical memory pressure check:
   // If memory load is >= 90%, or free physical RAM is < 512 MB,
   // or commit charge headroom is < 512 MB, no new jobs can be started.
-  if (mem_status.dwMemoryLoad >= kCriticalLoadPercent ||
-      mem_status.ullAvailPhys < kMinCriticalBytes ||
-      mem_status.ullAvailPageFile < kMinCriticalBytes) {
+  if (mem_info.memory_load >= kCriticalLoadPercent ||
+      mem_info.avail_phys < kMinCriticalBytes ||
+      mem_info.avail_page_file < kMinCriticalBytes) {
     return (running_jobs == 0) ? 1 : 0;
   }
 
   // 2. Safety reserve buffer:
-  uint64_t reserve_bytes = (mem_status.ullTotalPhys * kReservePercent) / 100;
+  uint64_t reserve_bytes = (mem_info.total_phys * kReservePercent) / 100;
   if (reserve_bytes < kMinReserveBytes) {
     reserve_bytes = kMinReserveBytes;
   } else if (reserve_bytes > kMaxReserveBytes) {
@@ -1039,21 +1035,21 @@ int GetMemoryPressureCapacity(size_t running_jobs, int max_parallelism) {
 
   // 3. Incremental headroom: how many additional jobs can fit into currently free unallocated RAM:
   int additional_headroom_jobs = 0;
-  if (mem_status.ullAvailPhys > reserve_bytes) {
-    uint64_t usable_ram = mem_status.ullAvailPhys - reserve_bytes;
+  if (mem_info.avail_phys > reserve_bytes) {
+    uint64_t usable_ram = mem_info.avail_phys - reserve_bytes;
     additional_headroom_jobs = static_cast<int>(usable_ram / kEstimatedJobBytes);
   }
 
   // 4. Memory-scaled total concurrency ceiling:
   // Scale upward with abundant memory, and scale down linearly between 70% and 90% load:
   int max_total_jobs = std::max(max_parallelism,
-      static_cast<int>((mem_status.ullTotalPhys > reserve_bytes)
-          ? ((mem_status.ullTotalPhys - reserve_bytes) / kEstimatedJobBytes)
+      static_cast<int>((mem_info.total_phys > reserve_bytes)
+          ? ((mem_info.total_phys - reserve_bytes) / kEstimatedJobBytes)
           : 1));
 
   int target_total_jobs = max_total_jobs;
-  if (mem_status.dwMemoryLoad > kWarningLoadPercent) {
-    double factor = static_cast<double>(kCriticalLoadPercent - mem_status.dwMemoryLoad) /
+  if (mem_info.memory_load > kWarningLoadPercent) {
+    double factor = static_cast<double>(kCriticalLoadPercent - mem_info.memory_load) /
                     static_cast<double>(kCriticalLoadPercent - kWarningLoadPercent);
     target_total_jobs = std::max(1, static_cast<int>(max_total_jobs * factor));
   }
@@ -1071,6 +1067,135 @@ int GetMemoryPressureCapacity(size_t running_jobs, int max_parallelism) {
     capacity = 1;
 
   return capacity;
+}
+
+bool ParseMeminfoValue(const char* buf, const char* key, uint64_t* out_kb) {
+  size_t key_len = strlen(key);
+  const char* p = buf;
+  while ((p = strstr(p, key)) != nullptr) {
+    if (p == buf || *(p - 1) == '\n') {
+      const char* val_start = p + key_len;
+      while (*val_start == ' ' || *val_start == '\t') {
+        val_start++;
+      }
+      if (*val_start == '-' || *val_start == '\0') {
+        return false;
+      }
+      char* end = nullptr;
+      uint64_t val = strtoull(val_start, &end, 10);
+      if (end != val_start) {
+        *out_kb = val;
+        return true;
+      }
+    }
+    p += key_len;
+  }
+  return false;
+}
+
+#if defined(_WIN32)
+static bool ReadSystemMemoryInfo(SystemMemoryInfo* mem_info) {
+  MEMORYSTATUSEX mem_status;
+  mem_status.dwLength = sizeof(mem_status);
+  if (!GlobalMemoryStatusEx(&mem_status)) {
+    return false;
+  }
+  mem_info->total_phys = mem_status.ullTotalPhys;
+  mem_info->avail_phys = mem_status.ullAvailPhys;
+  mem_info->avail_page_file = mem_status.ullAvailPageFile;
+  mem_info->memory_load = static_cast<uint32_t>(mem_status.dwMemoryLoad);
+  return true;
+}
+#elif defined(__linux__)
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+
+static bool ReadSystemMemoryInfo(SystemMemoryInfo* mem_info) {
+  int fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC);
+  if (fd >= 0) {
+    char buf[4096];
+    ssize_t total_read = 0;
+    while (total_read < static_cast<ssize_t>(sizeof(buf) - 1)) {
+      ssize_t n = read(fd, buf + total_read, sizeof(buf) - 1 - total_read);
+      if (n < 0) {
+        if (errno == EINTR)
+          continue;
+        break;
+      }
+      if (n == 0)
+        break;
+      total_read += n;
+    }
+    close(fd);
+
+    if (total_read > 0) {
+      buf[total_read] = '\0';
+      uint64_t mem_total_kb = 0;
+      uint64_t mem_free_kb = 0;
+      uint64_t mem_avail_kb = 0;
+      uint64_t buffers_kb = 0;
+      uint64_t cached_kb = 0;
+      uint64_t swap_free_kb = 0;
+
+      if (ParseMeminfoValue(buf, "MemTotal:", &mem_total_kb) && mem_total_kb > 0) {
+        bool has_mem_avail = ParseMeminfoValue(buf, "MemAvailable:", &mem_avail_kb);
+        ParseMeminfoValue(buf, "MemFree:", &mem_free_kb);
+        ParseMeminfoValue(buf, "Buffers:", &buffers_kb);
+        ParseMeminfoValue(buf, "Cached:", &cached_kb);
+        ParseMeminfoValue(buf, "SwapFree:", &swap_free_kb);
+
+        mem_info->total_phys = mem_total_kb * 1024ULL;
+        if (has_mem_avail) {
+          mem_info->avail_phys = mem_avail_kb * 1024ULL;
+        } else {
+          mem_info->avail_phys = (mem_free_kb + buffers_kb + cached_kb) * 1024ULL;
+        }
+        if (mem_info->avail_phys > mem_info->total_phys) {
+          mem_info->avail_phys = mem_info->total_phys;
+        }
+        uint64_t used_phys = mem_info->total_phys - mem_info->avail_phys;
+        mem_info->memory_load = static_cast<uint32_t>((used_phys * 100ULL) / mem_info->total_phys);
+        mem_info->avail_page_file = mem_info->avail_phys + (swap_free_kb * 1024ULL);
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+#endif
+
+#if defined(_WIN32) || defined(__linux__)
+static bool ReadSystemMemoryInfoCached(SystemMemoryInfo* mem_info) {
+  static SystemMemoryInfo cached_info;
+  static std::chrono::steady_clock::time_point last_read;
+  static bool has_cache = false;
+
+  auto now = std::chrono::steady_clock::now();
+  if (has_cache &&
+      std::chrono::duration_cast<std::chrono::milliseconds>(now - last_read).count() < 100) {
+    *mem_info = cached_info;
+    return true;
+  }
+
+  if (ReadSystemMemoryInfo(&cached_info)) {
+    last_read = now;
+    has_cache = true;
+    *mem_info = cached_info;
+    return true;
+  }
+  return false;
+}
+#endif
+
+int GetMemoryPressureCapacity(size_t running_jobs, int max_parallelism) {
+#if defined(_WIN32) || defined(__linux__)
+  SystemMemoryInfo mem_info;
+  if (!ReadSystemMemoryInfoCached(&mem_info)) {
+    return DefaultCapacity(running_jobs, max_parallelism);
+  }
+  return CalculateMemoryPressureCapacity(mem_info, running_jobs, max_parallelism);
 #else
   return DefaultCapacity(running_jobs, max_parallelism);
 #endif

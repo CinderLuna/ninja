@@ -521,3 +521,73 @@ TEST(MemoryPressure, Capacity) {
   int capNormal = GetMemoryPressureCapacity(0, 16);
   EXPECT_GE(capNormal, 1);
 }
+
+TEST(MemoryPressure, CalculationScenarios) {
+  SystemMemoryInfo mem;
+  constexpr uint64_t kGB = 1024ULL * 1024 * 1024;
+  constexpr uint64_t kMB = 1024ULL * 1024;
+
+  // 16 GB total, plenty free
+  mem.total_phys = 16 * kGB;
+  mem.avail_phys = 8 * kGB;
+  mem.avail_page_file = 16 * kGB;
+  mem.memory_load = 50;
+
+  EXPECT_GE(CalculateMemoryPressureCapacity(mem, 0, 8), 1);
+
+  // Critical memory load (>= 90%)
+  mem.memory_load = 92;
+  EXPECT_EQ(1, CalculateMemoryPressureCapacity(mem, 0, 8));
+  EXPECT_EQ(0, CalculateMemoryPressureCapacity(mem, 1, 8));
+
+  // Critical physical RAM (< 512 MB)
+  mem.memory_load = 50;
+  mem.avail_phys = 400 * kMB;
+  EXPECT_EQ(1, CalculateMemoryPressureCapacity(mem, 0, 8));
+  EXPECT_EQ(0, CalculateMemoryPressureCapacity(mem, 1, 8));
+
+  // Critical page file / swap (< 512 MB)
+  mem.avail_phys = 8 * kGB;
+  mem.avail_page_file = 400 * kMB;
+  EXPECT_EQ(1, CalculateMemoryPressureCapacity(mem, 0, 8));
+  EXPECT_EQ(0, CalculateMemoryPressureCapacity(mem, 1, 8));
+
+  // Scaling between 70% and 90% load
+  mem.avail_phys = 8 * kGB;
+  mem.avail_page_file = 16 * kGB;
+  mem.memory_load = 70;
+  int cap70 = CalculateMemoryPressureCapacity(mem, 0, 16);
+  mem.memory_load = 85;
+  int cap85 = CalculateMemoryPressureCapacity(mem, 0, 16);
+  EXPECT_GT(cap70, cap85);
+}
+
+TEST(MemoryPressure, ParseMeminfo) {
+  const char* sample =
+      "MemTotal:       16384000 kB\n"
+      "MemFree:         1024000 kB\n"
+      "MemAvailable:    8192000 kB\n"
+      "Buffers:          256000 kB\n"
+      "Cached:          4096000 kB\n"
+      "SwapCached:        16000 kB\n"
+      "SwapTotal:       2048000 kB\n"
+      "SwapFree:        1024000 kB\n"
+      "NegativeVal:      -1000 kB\n";
+
+  uint64_t val = 0;
+  EXPECT_TRUE(ParseMeminfoValue(sample, "MemTotal:", &val));
+  EXPECT_EQ(16384000ULL, val);
+
+  EXPECT_TRUE(ParseMeminfoValue(sample, "MemAvailable:", &val));
+  EXPECT_EQ(8192000ULL, val);
+
+  EXPECT_TRUE(ParseMeminfoValue(sample, "Cached:", &val));
+  EXPECT_EQ(4096000ULL, val);
+
+  EXPECT_TRUE(ParseMeminfoValue(sample, "SwapFree:", &val));
+  EXPECT_EQ(1024000ULL, val);
+
+  EXPECT_FALSE(ParseMeminfoValue(sample, "NonExistent:", &val));
+  EXPECT_FALSE(ParseMeminfoValue(sample, "NegativeVal:", &val));
+  EXPECT_FALSE(ParseMeminfoValue("", "MemTotal:", &val));
+}
