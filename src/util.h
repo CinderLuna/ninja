@@ -102,6 +102,11 @@ int GetProcessorCount();
 /// on error.
 double GetLoadAverage();
 
+/// @return the number of additional concurrent jobs that can be started given
+/// the current system memory pressure, with \a running_jobs currently active
+/// and baseline parallelism \a max_parallelism.
+int GetMemoryPressureCapacity(size_t running_jobs, int max_parallelism);
+
 /// a wrapper for getcwd()
 std::string GetWorkingDirectory();
 

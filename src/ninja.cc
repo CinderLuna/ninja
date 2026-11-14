@@ -1874,6 +1874,11 @@ int ReadFlags(int* argc, char*** argv,
         options->input_file = optarg;
         break;
       case 'j': {
+#ifdef _WIN32
+        // On Windows, -j flag is ignored regardless of argument; compilation
+        // concurrency scales dynamically depending on system memory pressure.
+        static_cast<void>(optarg);
+#else
         char* end;
         long value = strtol(optarg, &end, 10);
         if (*end != 0 || value < 0)
@@ -1885,6 +1890,7 @@ int ReadFlags(int* argc, char*** argv,
             static_cast<int>((value > 0 && value < INT_MAX) ? value : INT_MAX);
         config->explicit_parallelism = true;
         deferGuessParallelism.needGuess = false;
+#endif
         break;
       }
       case 'k': {

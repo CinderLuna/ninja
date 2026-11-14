@@ -998,6 +998,84 @@ double GetLoadAverage() {
 }
 #endif // _WIN32
 
+static int DefaultCapacity(size_t running_jobs, int max_parallelism) {
+  int64_t capacity = static_cast<int64_t>(max_parallelism) - static_cast<int64_t>(running_jobs);
+  return capacity > 0 ? static_cast<int>(capacity) : 0;
+}
+
+int GetMemoryPressureCapacity(size_t running_jobs, int max_parallelism) {
+#if defined(_WIN32)
+  MEMORYSTATUSEX mem_status;
+  mem_status.dwLength = sizeof(mem_status);
+  if (!GlobalMemoryStatusEx(&mem_status)) {
+    return DefaultCapacity(running_jobs, max_parallelism);
+  }
+
+  // Named constants for memory pressure thresholds
+  constexpr uint64_t kMinCriticalBytes = 512ULL * 1024 * 1024;    // 512 MB critical threshold
+  constexpr uint64_t kEstimatedJobBytes = 768ULL * 1024 * 1024;   // 768 MB estimated per compiler job
+  constexpr uint64_t kMinReserveBytes = 1024ULL * 1024 * 1024;    // 1.0 GB minimum OS buffer
+  constexpr uint64_t kMaxReserveBytes = 3072ULL * 1024 * 1024;    // 3.0 GB maximum OS buffer
+  constexpr uint64_t kReservePercent = 8;                          // 8% of total RAM for OS/interactive apps
+  constexpr uint32_t kCriticalLoadPercent = 90;                    // 90% memory load critical cap
+  constexpr uint32_t kWarningLoadPercent = 70;                     // 70% memory load scaling start
+
+  // 1. Critical memory pressure check:
+  // If memory load is >= 90%, or free physical RAM is < 512 MB,
+  // or commit charge headroom is < 512 MB, no new jobs can be started.
+  if (mem_status.dwMemoryLoad >= kCriticalLoadPercent ||
+      mem_status.ullAvailPhys < kMinCriticalBytes ||
+      mem_status.ullAvailPageFile < kMinCriticalBytes) {
+    return (running_jobs == 0) ? 1 : 0;
+  }
+
+  // 2. Safety reserve buffer:
+  uint64_t reserve_bytes = (mem_status.ullTotalPhys * kReservePercent) / 100;
+  if (reserve_bytes < kMinReserveBytes) {
+    reserve_bytes = kMinReserveBytes;
+  } else if (reserve_bytes > kMaxReserveBytes) {
+    reserve_bytes = kMaxReserveBytes;
+  }
+
+  // 3. Incremental headroom: how many additional jobs can fit into currently free unallocated RAM:
+  int additional_headroom_jobs = 0;
+  if (mem_status.ullAvailPhys > reserve_bytes) {
+    uint64_t usable_ram = mem_status.ullAvailPhys - reserve_bytes;
+    additional_headroom_jobs = static_cast<int>(usable_ram / kEstimatedJobBytes);
+  }
+
+  // 4. Memory-scaled total concurrency ceiling:
+  // Scale upward with abundant memory, and scale down linearly between 70% and 90% load:
+  int max_total_jobs = std::max(max_parallelism,
+      static_cast<int>((mem_status.ullTotalPhys > reserve_bytes)
+          ? ((mem_status.ullTotalPhys - reserve_bytes) / kEstimatedJobBytes)
+          : 1));
+
+  int target_total_jobs = max_total_jobs;
+  if (mem_status.dwMemoryLoad > kWarningLoadPercent) {
+    double factor = static_cast<double>(kCriticalLoadPercent - mem_status.dwMemoryLoad) /
+                    static_cast<double>(kCriticalLoadPercent - kWarningLoadPercent);
+    target_total_jobs = std::max(1, static_cast<int>(max_total_jobs * factor));
+  }
+
+  // Capacity allowed under the total target ceiling:
+  int capacity_by_target = target_total_jobs - static_cast<int>(running_jobs);
+  if (capacity_by_target < 0)
+    capacity_by_target = 0;
+
+  // Final capacity is constrained by both unallocated physical RAM headroom and the load target:
+  int capacity = std::min(additional_headroom_jobs, capacity_by_target);
+
+  // Guarantee forward progress if no jobs are running
+  if (capacity <= 0 && running_jobs == 0)
+    capacity = 1;
+
+  return capacity;
+#else
+  return DefaultCapacity(running_jobs, max_parallelism);
+#endif
+}
+
 std::string GetWorkingDirectory() {
   std::string ret;
   char* success = NULL;

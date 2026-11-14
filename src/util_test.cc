@@ -507,3 +507,17 @@ TEST(StripAnsiEscapeCodes, StripColors) {
   EXPECT_EQ("affixmgr.cxx:286:15: warning: using the result... [-Wparentheses]",
             stripped);
 }
+
+TEST(MemoryPressure, Capacity) {
+  // When no jobs are running, capacity should be at least 1 to guarantee progress
+  int cap0 = GetMemoryPressureCapacity(0, 1);
+  EXPECT_GE(cap0, 1);
+
+  // When lots of jobs are already running, capacity should drop to 0
+  int capRunning = GetMemoryPressureCapacity(1000, 16);
+  EXPECT_EQ(0, capRunning);
+
+  // Normal query with 0 running jobs and baseline 16
+  int capNormal = GetMemoryPressureCapacity(0, 16);
+  EXPECT_GE(capNormal, 1);
+}

@@ -17,6 +17,7 @@
 #include "jobserver.h"
 #include "limits.h"
 #include "subprocess.h"
+#include "util.h"
 
 struct RealCommandRunner : public CommandRunner {
   explicit RealCommandRunner(const BuildConfig& config,
@@ -61,7 +62,8 @@ size_t RealCommandRunner::CanRunMore() const {
   size_t subproc_number =
       subprocs_.running_.size() + subprocs_.finished_.size();
 
-  int64_t capacity = config_.parallelism - subproc_number;
+  int64_t capacity =
+      GetMemoryPressureCapacity(subproc_number, config_.parallelism);
 
   if (jobserver_) {
     // When a jobserver token pool is used, make the
