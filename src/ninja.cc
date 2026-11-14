@@ -1874,8 +1874,8 @@ int ReadFlags(int* argc, char*** argv,
         options->input_file = optarg;
         break;
       case 'j': {
-#ifdef _WIN32
-        // On Windows, -j flag is ignored regardless of argument; compilation
+#if defined(_WIN32) || defined(__linux__)
+        // On Windows and Linux, -j flag is ignored regardless of argument; compilation
         // concurrency scales dynamically depending on system memory pressure.
         static_cast<void>(optarg);
 #else

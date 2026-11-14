@@ -102,6 +102,21 @@ int GetProcessorCount();
 /// on error.
 double GetLoadAverage();
 
+struct SystemMemoryInfo {
+  uint64_t total_phys = 0;
+  uint64_t avail_phys = 0;
+  uint64_t avail_page_file = 0;
+  uint32_t memory_load = 0;
+};
+
+/// Computes the available job capacity based on the provided memory statistics.
+int CalculateMemoryPressureCapacity(const SystemMemoryInfo& mem_info,
+                                   size_t running_jobs,
+                                   int max_parallelism);
+
+/// Helper to parse a kB value for a given key from /proc/meminfo buffer.
+bool ParseMeminfoValue(const char* buf, const char* key, uint64_t* out_kb);
+
 /// @return the number of additional concurrent jobs that can be started given
 /// the current system memory pressure, with \a running_jobs currently active
 /// and baseline parallelism \a max_parallelism.

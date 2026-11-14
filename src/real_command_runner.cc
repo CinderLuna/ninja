@@ -59,18 +59,18 @@ void RealCommandRunner::Abort() {
 }
 
 size_t RealCommandRunner::CanRunMore() const {
+  if (jobserver_) {
+    // When a jobserver token pool is used, make the
+    // capacity infinite, and let FindWork() limit jobs
+    // through token acquisitions instead.
+    return INT_MAX;
+  }
+
   size_t subproc_number =
       subprocs_.running_.size() + subprocs_.finished_.size();
 
   int64_t capacity =
       GetMemoryPressureCapacity(subproc_number, config_.parallelism);
-
-  if (jobserver_) {
-    // When a jobserver token pool is used, make the
-    // capacity infinite, and let FindWork() limit jobs
-    // through token acquisitions instead.
-    capacity = INT_MAX;
-  }
 
   if (config_.max_load_average > 0.0f) {
     int load_capacity = static_cast<int>(config_.max_load_average - GetLoadAverage());
